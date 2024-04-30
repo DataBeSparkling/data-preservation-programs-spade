@@ -1,0 +1,8 @@
+{
+  "response_timestamp": "<!--# echo var="time_iso8601" default="" -->",
+  "response_code": <!--# echo var="status" default="000" -->,
+  "info_lines": [
+    " You have made a request of '<!--# echo var="request_uri" -->' ",
+    " which resulted in a redirect: <!--# echo var="status" default="000" --> ",
+  ]
+}

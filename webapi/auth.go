@@ -1,0 +1,314 @@
+package main
+
+import (
+	"context"
+	"encoding/base64"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"net/url"
+	"regexp"
+	"strconv"
+	"time"
+
+	"github.com/data-preservation-programs/spade/apitypes"
+	"github.com/data-preservation-programs/spade/internal/app"
+	filaddr "github.com/filecoin-project/go-address"
+	filabi "github.com/filecoin-project/go-state-types/abi"
+	filprovider "github.com/filecoin-project/go-state-types/builtin/v9/miner"
+	lru "github.com/hashicorp/golang-lru/v2"
+	blsgo "github.com/jsign/go-filsigner/bls"
+	"github.com/labstack/echo/v4"
+	"github.com/ribasushi/go-toolbox-interplanetary/fil"
+	"github.com/ribasushi/go-toolbox/cmn"
+)
+
+const (
+	sigGraceEpochs = 3
+	authScheme     = `FIL-SPID-V0`
+)
+
+type rawHdr struct {
+	epoch  string
+	addr   string
+	sigB64 string
+	arg    string
+}
+type sigChallenge struct {
+	authHdr string
+	addr    filaddr.Address
+	epoch   int64
+	arg     []byte
+	hdr     rawHdr
+}
+
+type verifySigResult struct {
+	invalidSigErrstr string
+}
+
+var (
+	spAuthRe = regexp.MustCompile(
+		`^` + authScheme + `\s+` +
+			// fil epoch
+			`([0-9]+)` + `\s*;\s*` +
+			// spID
+			`([ft]0[0-9]+)` + `\s*;\s*` +
+			// legacy crap, remove once contract signing in place for everyone
+			`(?:\s*2\s*;)?` +
+			// signature
+			`([^; ]+)` +
+			// optional signed argument
+			`(?:\s*\;\s*([^; ]+))?` +
+			`\s*$`,
+	)
+	challengeCache, _ = lru.New[rawHdr, verifySigResult](sigGraceEpochs * 128)
+	beaconCache, _    = lru.New[int64, *fil.LotusBeaconEntry](sigGraceEpochs * 4)
+)
+
+func spidAuth(next echo.HandlerFunc) echo.HandlerFunc {
+	return func(c echo.Context) error {
+
+		ctx, log, _, _ := app.UnpackCtx(c.Request().Context())
+
+		// the SP portion does not accept body payloads
+		if b := c.Request().Body; b != nil && c.Request().ContentLength != 0 {
+			if _, err := b.Read(make([]byte, 1)); err != io.EOF {
+				return retFail(c, apitypes.ErrInvalidRequest, "spid requests witn content in the HTTP body are not supported")
+			}
+		}
+
+		var challenge sigChallenge
+		challenge.authHdr = c.Request().Header.Get(echo.HeaderAuthorization)
+		res := spAuthRe.FindStringSubmatch(challenge.authHdr)
+
+		if len(res) == 5 {
+			challenge.hdr.epoch, challenge.hdr.addr, challenge.hdr.sigB64, challenge.hdr.arg = res[1], res[2], res[3], res[4]
+		} else {
+			return retAuthFail(c, "invalid/unexpected %s Authorization header '%s'", authScheme, challenge.authHdr)
+		}
+
+		var err error
+		challenge.addr, err = filaddr.NewFromString(challenge.hdr.addr)
+		if err != nil {
+			return retAuthFail(c, "unexpected %s auth address '%s'", authScheme, challenge.hdr.addr)
+		}
+
+		challenge.epoch, err = strconv.ParseInt(challenge.hdr.epoch, 10, 32)
+		if err != nil {
+			return retAuthFail(c, "unexpected %s auth epoch '%s'", authScheme, challenge.hdr.epoch)
+		}
+
+		curFilEpoch := int64(fil.ClockMainnet.TimeToEpoch(time.Now()))
+		if curFilEpoch < challenge.epoch {
+			log.Debugw("challenge from the future", "challengeEpoch", challenge.epoch, "wallEpoch", curFilEpoch)
+			return retAuthFail(c, "%s auth epoch '%d' is in the future", authScheme, challenge.epoch)
+		}
+		if curFilEpoch-challenge.epoch > sigGraceEpochs {
+			return retAuthFail(c, "%s auth epoch '%d' is too far in the past", authScheme, challenge.epoch)
+		}
+
+		challenge.arg, err = base64.StdEncoding.DecodeString(challenge.hdr.arg)
+		if err != nil {
+			return retAuthFail(c, "unable to decode optional argument: %s", err.Error())
+		}
+
+		signedArgs, err := url.ParseQuery(string(challenge.arg))
+		if err != nil {
+			return retAuthFail(c, "unable to parse optional argument: %s", err.Error())
+		}
+
+		var vsr verifySigResult
+		if maybeResult, known := challengeCache.Get(challenge.hdr); known {
+			vsr = maybeResult
+		} else {
+			vsr, err = verifySig(ctx, challenge)
+			if err != nil {
+				return cmn.WrErr(err)
+			}
+			challengeCache.Add(challenge.hdr, vsr)
+		}
+
+		if vsr.invalidSigErrstr != "" {
+			return retAuthFail(c, vsr.invalidSigErrstr)
+		}
+
+		// set only on request object for logging, not part of response
+		c.Request().Header.Set("X-SPADE-LOGGED-SP", challenge.addr.String())
+
+		// if challenge.addr.String() == "f01" {
+		// 	challenge.addr, _ = filaddr.NewFromString("f02")
+		// }
+
+		spID := fil.MustParseActorString(challenge.addr.String())
+
+		reqCopy := c.Request().Clone(ctx)
+		// do not need to store any IPs anywhere in the DB
+		for _, strip := range []string{
+			"X-Real-Ip", "X-Forwarded-For", "Cf-Connecting-Ip",
+		} {
+			delete(reqCopy.Header, strip)
+		}
+
+		reqJ, err := json.Marshal(
+			struct {
+				Method       string
+				Host         string
+				Path         string
+				Params       string
+				ParamsSigned url.Values
+				Headers      http.Header
+			}{
+				Method:       reqCopy.Method,
+				Host:         reqCopy.Host,
+				Path:         reqCopy.URL.Path,
+				Params:       reqCopy.URL.Query().Encode(),
+				ParamsSigned: signedArgs,
+				Headers:      reqCopy.Header,
+			},
+		)
+		if err != nil {
+			return cmn.WrErr(err)
+		}
+
+		spDetails := [4]int16{-1, -1, -1, -1}
+		var requestUUID string
+		var stateEpoch int64
+		var spInfo apitypes.SPInfo
+		var spInfoLastPoll *time.Time
+		if err := app.GetGlobalCtx(ctx).Db[app.DbMain].QueryRow(
+			ctx,
+			`
+			INSERT INTO spd.requests ( provider_id, request_dump )
+				VALUES ( $1, $2 )
+			RETURNING
+				request_uuid,
+				( SELECT ( metadata->'market_state'->'epoch' )::INTEGER FROM spd.global ),
+				(
+					SELECT
+						ARRAY[
+							COALESCE( org_id, -1 ),
+							COALESCE( city_id, -1),
+							COALESCE( country_id, -1),
+							COALESCE( continent_id, -1)
+						]
+					FROM spd.providers
+					WHERE provider_id = $1
+				),
+				(
+					SELECT info
+						FROM spd.providers_info
+					WHERE provider_id = $1
+				),
+				(
+					SELECT provider_last_polled
+						FROM spd.providers_info
+					WHERE provider_id = $1
+				)
+			`,
+			spID,
+			reqJ,
+		).Scan(&requestUUID, &stateEpoch, &spDetails, &spInfo, &spInfoLastPoll); err != nil {
+			return cmn.WrErr(err)
+		}
+
+		c.Response().Header().Set("X-SPADE-FIL-SPID", challenge.addr.String())
+
+		// set on both request (for logging ) and response object
+		c.Request().Header.Set("X-SPADE-REQUEST-UUID", requestUUID)
+		c.Response().Header().Set("X-SPADE-REQUEST-UUID", requestUUID)
+
+		c.Set("♠️", metaContext{
+			GlobalContext:    app.GetGlobalCtx(ctx),
+			stateEpoch:       stateEpoch,
+			authedActorID:    spID,
+			signedArgs:       signedArgs,
+			spOrgID:          spDetails[0],
+			spCityID:         spDetails[1],
+			spCountryID:      spDetails[2],
+			spContinentID:    spDetails[3],
+			spInfo:           spInfo,
+			spInfoLastPolled: spInfoLastPoll,
+		})
+
+		return next(c)
+	}
+}
+
+type metaContext struct {
+	app.GlobalContext
+	authedActorID    fil.ActorID
+	stateEpoch       int64
+	spInfo           apitypes.SPInfo
+	spInfoLastPolled *time.Time
+	spOrgID          int16
+	spCityID         int16
+	spCountryID      int16
+	spContinentID    int16
+	signedArgs       url.Values
+}
+
+func unpackAuthedEchoContext(c echo.Context) (context.Context, metaContext) {
+	meta, _ := c.Get("♠️").(metaContext) // ignore potential nil error on purpose
+	return c.Request().Context(), meta
+}
+
+func verifySig(ctx context.Context, challenge sigChallenge) (verifySigResult, error) {
+
+	sig, err := base64.StdEncoding.DecodeString(challenge.hdr.sigB64)
+	if err != nil {
+		return verifySigResult{
+			invalidSigErrstr: fmt.Sprintf("unexpected %s auth signature encoding '%s'", authScheme, challenge.hdr.sigB64),
+		}, nil
+	}
+
+	lAPI := app.GetGlobalCtx(ctx).LotusAPI
+
+	be, didFind := beaconCache.Get(challenge.epoch)
+	if !didFind {
+		// this should work but doesn't...
+		//
+		// curChallengeTs, err := lAPI.ChainGetTipSetByHeight(ctx, filabi.ChainEpoch(challenge.epoch), fil.LotusTSK{})
+		// if err != nil {
+		// 	return verifySigResult{}, cmn.WrErr(err)
+		// }
+		// be = &curChallengeTs.Blocks()[0].BeaconEntries[0]
+
+		be, err = lAPI.BeaconGetEntry(ctx, filabi.ChainEpoch(challenge.epoch))
+		if err != nil {
+			return verifySigResult{}, cmn.WrErr(err)
+		}
+
+		beaconCache.Add(challenge.epoch, be)
+	}
+
+	miFinTs, err := lAPI.ChainGetTipSetByHeight(ctx, filabi.ChainEpoch(challenge.epoch)-filprovider.ChainFinality, fil.LotusTSK{})
+	if err != nil {
+		return verifySigResult{}, cmn.WrErr(err)
+	}
+	mi, err := lAPI.StateMinerInfo(ctx, challenge.addr, miFinTs.Key())
+	if err != nil {
+		return verifySigResult{}, cmn.WrErr(err)
+	}
+	workerAddr, err := lAPI.StateAccountKey(ctx, mi.Worker, miFinTs.Key())
+	if err != nil {
+		return verifySigResult{}, cmn.WrErr(err)
+	}
+
+	// worker keys are always BLS
+	sigMatch, err := blsgo.Verify(
+		workerAddr.Payload(),
+		append(append([]byte{0x20, 0x20, 0x20}, be.Data...), challenge.arg...),
+		[]byte(sig),
+	)
+	if err != nil {
+		return verifySigResult{}, cmn.WrErr(err)
+	}
+
+	if !sigMatch {
+		return verifySigResult{
+			invalidSigErrstr: fmt.Sprintf("%s signature validation failed for auth header '%s'", authScheme, challenge.authHdr),
+		}, nil
+	}
+	return verifySigResult{}, nil
+}
