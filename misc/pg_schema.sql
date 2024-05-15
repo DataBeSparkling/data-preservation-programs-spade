@@ -195,20 +195,18 @@ CREATE TABLE IF NOT EXISTS spd.tenants_pieces (
 CREATE INDEX IF NOT EXISTS tenants_pieces_dataset ON spd.tenants_pieces ( tenant_id, dataset_id );
 CREATE INDEX IF NOT EXISTS tenants_pieces_active ON spd.tenants_pieces ( piece_id ) WHERE NOT piece_inactivated;
 
-CREATE TABLE IF NOT EXISTS spd.piece_source_types (
-  source_type_id SMALLSERIAL NOT NULL UNIQUE,
-  source_type TEXT NOT NULL UNIQUE
+CREATE TABLE IF NOT EXISTS spd.sources_uri (
+  piece_id BIGINT UNIQUE NOT NULL REFERENCES spd.pieces ( piece_id ) ON UPDATE CASCADE,
+  uri TEXT UNIQUE NOT NULL
 );
-INSERT INTO spd.piece_source_types ( source_type ) VALUES ( 'http' ), ( 's3' ) ON CONFLICT DO NOTHING;
-INSERT INTO spd.piece_source_types ( source_type_id, source_type ) VALUES ( -1, 'filsp' ), ( -2, 'filsphttp' ) ON CONFLICT DO NOTHING; -- negatives are stable magic numbers, do not change!!!
 
-CREATE TABLE IF NOT EXISTS spd.piece_sources (
-  source_id BIGSERIAL NOT NULL UNIQUE,
+CREATE TABLE IF NOT EXISTS spd.piece_segments (
   piece_id BIGINT NOT NULL REFERENCES spd.pieces ( piece_id ) ON UPDATE CASCADE,
-  source_type_id SMALLINT NOT NULL REFERENCES spd.piece_source_types ( source_type_id ),
-  source_inactivated BOOL NOT NULL DEFAULT false,
-  contract_restricted BOOL NOT NULL DEFAULT false
+  segment_id BIGINT NOT NULL REFERENCES spd.pieces ( piece_id ) ON UPDATE CASCADE,
+  position INTEGER NOT NULL,
+  CONSTRAINT ordered_segments UNIQUE ( piece_id, position )
 );
+CREATE INDEX IF NOT EXISTS piece_segments_piece ON spd.piece_segments ( piece_id, position );
 
 CREATE TABLE IF NOT EXISTS spd.clients (
   client_id INTEGER UNIQUE NOT NULL,

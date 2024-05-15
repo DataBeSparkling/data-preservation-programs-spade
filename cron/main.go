@@ -33,6 +33,7 @@ func main() {
 				trackDeals,
 				signPending,
 				proposePending,
+				bulkPiecePoll,
 			},
 			Flags: app.CommonFlags,
 		},
