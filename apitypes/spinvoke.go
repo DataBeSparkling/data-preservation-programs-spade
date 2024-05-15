@@ -22,5 +22,7 @@ type DealProposal struct {
 	StartTime      time.Time `json:"deal_start_time"`
 	StartEpoch     int64     `json:"deal_start_epoch"`
 	ImportCmd      string    `json:"sample_import_cmd"`
+	Segmentation   *string   `json:"segmentation_type"`
+	AssemblyCmd    *string   `json:"sample_assembly_cmd,omitempty"`
 	DataSources    []string  `json:"data_sources,omitempty"`
 }

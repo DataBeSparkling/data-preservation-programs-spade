@@ -41,6 +41,15 @@ func registerRoutes(e *echo.Echo) {
 	spRoutes.GET("/pending_proposals", apiSpListPendingProposals)
 
 	//
+	// /piece_manifest produces a manifest for a segmented piece. You need a reservation proposal UUID to call this.
+	//
+	// Required parameters:
+	//
+	// - proposal = <uuid>
+	//
+	spRoutes.GET("/piece_manifest", apiSpPieceManifest)
+
+	//
 	// /invoke is the sole mutating (POST) method, with several recognized RPC-calls:
 	//
 	// - reserve_piece: used to request a deal proposal (and thus reservation) for a specific

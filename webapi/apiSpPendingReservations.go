@@ -62,7 +62,10 @@ func apiSpListPendingProposals(c echo.Context) error {
 				) ) AS is_published,
 				ARRAY(
 					SELECT uri FROM spd.sources_uri WHERE sources_uri.piece_id = pr.piece_id
-				) AS data_sources
+				) AS data_sources,
+				(
+					CASE WHEN (p.piece_meta->'is_frc58_segmented')::bool THEN 'frc58' ELSE NULL END
+				) AS segmentation
 			FROM spd.proposals pr
 			JOIN spd.pieces p USING ( piece_id )
 			JOIN spd.clients c USING ( client_id )
@@ -140,9 +143,14 @@ func apiSpListPendingProposals(c echo.Context) error {
 			dp.TenantClient = p.ClientID.String()
 			// should never be nil but be cautious
 			if dp.ProposalID != "" {
-				dp.ImportCmd = fmt.Sprintf("boostd import-data --delete-after-import %s {{downloaded_file}}.car",
+				dp.ImportCmd = fmt.Sprintf("boostd import-data --delete-after-import %s {{downloaded_or_assembled_file}}",
 					dp.ProposalID,
 				)
+			}
+			// when segmented
+			if dp.Segmentation != nil && *dp.Segmentation == "frc58" {
+				ass := curlAuthedForSP(c, ctxMeta.authedActorID, "/sp/piece_manifest?proposal="+dp.ProposalID, nil) + " | jq .response | fil-datasegment from-manifest"
+				dp.AssemblyCmd = &ass
 			}
 
 			ret.PendingProposals = append(ret.PendingProposals, dp)
